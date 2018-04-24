@@ -39,6 +39,23 @@
 #include <linux/irq.h>
 #include <linux/uaccess.h>
 
+#define MAPPED_SIZE  0x100000 //place the size here
+#define DDR_RAM_PHYS 0x3f200000
+#define MAPPED_SIZE_TX  0xFFE00//0x5000 //place the size here
+
+
+#define MAPPED_SIZE_RX  0x100 //(DDR_RAM_PHYS+MAPPED_SIZE_TX)
+
+#define SYNC_POINTER_OFFSET (MAPPED_SIZE_TX+MAPPED_SIZE_RX) //0x6000
+#define WRITE_PTR_OFFSET SYNC_POINTER_OFFSET 
+#define READ_PTR_OFFSET (SYNC_POINTER_OFFSET+4)
+
+static volatile unsigned char *sh_ptr;
+static volatile int *ptr =0 ;
+static unsigned int write_ptr = 0;
+
+static unsigned int read_ptr = 0;
+
 /*
  * This is used to lock changes in serial line configuration.
  */
@@ -571,12 +588,21 @@ static int uart_write(struct tty_struct *tty,
 	struct uart_port *port;
 	struct circ_buf *circ;
 	unsigned long flags;
-	int c, ret = 0;
-
+	int c,i, ret = 0;
+	printk("\nuart write :%d\n",write_ptr);
 	/*
 	 * This means you called this function _after_ the port was
 	 * closed.  No cookie for you.
 	 */
+#if 0
+	if(ptr == 0)
+	{
+	void __iomem *sample = ioremap((DDR_RAM_PHYS+WRITE_PTR_OFFSET),MAPPED_SIZE_RX);
+	ptr = (int*)sample;
+	ptr = write_ptr;
+	}
+#endif
+	printk("uarrt write ptr:%d",*(sh_ptr + WRITE_PTR_OFFSET));
 	if (!state) {
 		WARN_ON(1);
 		return -EL3HLT;
@@ -587,6 +613,17 @@ static int uart_write(struct tty_struct *tty,
 		return 0;
 
 	port = uart_port_lock(state, flags);
+#if 1 
+        for(i=0; i<count; i++)
+	{
+	*(sh_ptr + write_ptr) = *(buf+i);
+	write_ptr += 1;
+	}
+	
+	*(sh_ptr + WRITE_PTR_OFFSET) = write_ptr;	
+	//ptr= write_ptr;
+#endif
+
 	while (port) {
 		c = CIRC_SPACE_TO_END(circ->head, circ->tail, UART_XMIT_SIZE);
 		if (count < c)
@@ -599,6 +636,8 @@ static int uart_write(struct tty_struct *tty,
 		count -= c;
 		ret += c;
 	}
+
+	//printk("\nafter while uart write\n");
 
 	__uart_start(tty);
 	uart_port_unlock(port, flags);
@@ -987,6 +1026,8 @@ static int uart_set_info(struct tty_struct *tty, struct tty_port *port,
 		}
 	} else {
 		retval = uart_startup(tty, state, 1);
+		if (retval == 0)
+			tty_port_set_initialized(port, true);
 		if (retval > 0)
 			retval = 0;
 	}
@@ -1483,7 +1524,7 @@ static void uart_close(struct tty_struct *tty, struct file *filp)
 {
 	struct uart_state *state = tty->driver_data;
 	struct tty_port *port;
-
+	printk("\nuart_close...\n");
 	if (!state) {
 		struct uart_driver *drv = tty->driver->driver_state;
 
@@ -1706,9 +1747,8 @@ static int uart_open(struct tty_struct *tty, struct file *filp)
 	struct uart_driver *drv = tty->driver->driver_state;
 	int retval, line = tty->index;
 	struct uart_state *state = drv->state + line;
-
 	tty->driver_data = state;
-
+	printk("\nuart open..\n");
 	retval = tty_port_open(&state->port, tty, filp);
 	if (retval > 0)
 		retval = 0;
@@ -1860,16 +1900,50 @@ static const struct file_operations uart_proc_fops = {
  *	@count: number of characters in string to write
  *	@putchar: function to write character to port
  */
+
+
+static void shared_mem(struct uart_port *port, unsigned char ch, void (*putchar)(struct uart_port *, int))
+{
+	/*putchar(port,'=');
+	putchar(port,'=');
+	putchar(port,'=');
+	putchar(port,'=');*/
+	unsigned int i;
+	
+	if(write_ptr == 0)
+	{
+		void __iomem *shared_virt = ioremap(DDR_RAM_PHYS, MAPPED_SIZE);
+		sh_ptr = (char *)shared_virt;
+		for(i=0 ; i<MAPPED_SIZE; i++)
+			sh_ptr[i] = 0;
+		
+		void __iomem *shm_pointer = ioremap((DDR_RAM_PHYS + WRITE_PTR_OFFSET),MAPPED_SIZE_RX);
+		
+		ptr = (int *)shm_pointer;
+	}
+
+	*(sh_ptr + write_ptr) = ch;
+	write_ptr = write_ptr + 1;
+	//*(sh_ptr + WRITE_PTR_OFFSET) = write_ptr;
+	*ptr = write_ptr;
+}
+
+
 void uart_console_write(struct uart_port *port, const char *s,
 			unsigned int count,
 			void (*putchar)(struct uart_port *, int))
 {
 	unsigned int i;
-
+	
 	for (i = 0; i < count; i++, s++) {
 		if (*s == '\n')
+		{
 			putchar(port, '\r');
+			shared_mem(port, '\r',putchar);
+		}
+
 		putchar(port, *s);
+		shared_mem(port, *s,putchar);
 	}
 }
 EXPORT_SYMBOL_GPL(uart_console_write);
@@ -2454,11 +2528,12 @@ static const struct tty_port_operations uart_port_ops = {
  *	drv->port should be NULL, and the per-port structures should be
  *	registered using uart_add_one_port after this call has succeeded.
  */
+
 int uart_register_driver(struct uart_driver *drv)
 {
 	struct tty_driver *normal;
 	int i, retval;
-
+	printk("\nuart_register_driver init..dr :%d\n",drv->nr);
 	BUG_ON(drv->state);
 
 	/*
@@ -2479,6 +2554,7 @@ int uart_register_driver(struct uart_driver *drv)
 	normal->name		= drv->dev_name;
 	normal->major		= drv->major;
 	normal->minor_start	= drv->minor;
+	printk("\nuart major: %d\t minor: %d\n",drv->major,drv->minor);
 	normal->type		= TTY_DRIVER_TYPE_SERIAL;
 	normal->subtype		= SERIAL_TYPE_NORMAL;
 	normal->init_termios	= tty_std_termios;
@@ -2496,10 +2572,12 @@ int uart_register_driver(struct uart_driver *drv)
 		struct tty_port *port = &state->port;
 
 		tty_port_init(port);
+
 		port->ops = &uart_port_ops;
 	}
 
 	retval = tty_register_driver(normal);
+	printk("\nuart driver init success..%d\n",retval);
 	if (retval >= 0)
 		return retval;
 
@@ -2535,8 +2613,18 @@ void uart_unregister_driver(struct uart_driver *drv)
 	drv->tty_driver = NULL;
 }
 
+struct tty_driver *virtual_console_device(struct console *co, int *index)
+{
+        printk("\nvirtual_console_device..\n");
+        struct uart_driver *p = co->data;
+        *index = co->index;
+        return p->tty_driver;
+}
+
+
 struct tty_driver *uart_console_device(struct console *co, int *index)
 {
+	printk("\nuart_console_device..\n");
 	struct uart_driver *p = co->data;
 	*index = co->index;
 	return p->tty_driver;
