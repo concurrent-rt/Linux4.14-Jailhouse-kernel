@@ -133,8 +133,8 @@ static void tpk_close(struct tty_struct *tty, struct file *filp)
  * TTY operations write function.
  */
 static unsigned int write_ptr =0;
-//static unsigned int uart_read_ptr =0;// ,read_ptr =0;
-static volatile unsigned int *wr_ptr;
+static unsigned int uart_read_ptr =0;
+static volatile unsigned int *wr_ptr,*read;
 
 static int tpk_write(struct tty_struct *tty,
 		const unsigned char *buf, int count)
@@ -149,10 +149,9 @@ static int tpk_write(struct tty_struct *tty,
 	
 	if(!tpkp->open_count)
 		goto exit;
-	
+
 	/* exclusive use of tpk_printk within this tty */
 	mutex_lock(&tpkp->port_write_mutex);
-
 
 	if(write_ptr == 0)
         {
@@ -161,21 +160,34 @@ static int tpk_write(struct tty_struct *tty,
 		
 		void __iomem *shm_ptr = ioremap((DDR_RAM_PHYS+WRITE_PTR_OFFSET),						MAPPED_SIZE_RX);
 		wr_ptr =(int *)shm_ptr;
+		
+		void __iomem *rd_ptr = ioremap((DDR_RAM_PHYS + READ_PTR_OFFSET),								MAPPED_SIZE_RX);
+		read = (int *)rd_ptr;
 	}
-	//uart_write_ptr = *(sh_ptr+ WRITE_PTR_OFFSET);
 	uart_write_ptr = *wr_ptr;
 	printk("\nuart_write_ptr :%d\t local_write_ptr:%d\n",
 						uart_write_ptr,write_ptr);
-	if(uart_write_ptr >write_ptr)
+	if(uart_write_ptr > write_ptr)
 	{
 
-	  for(i=0;i<((uart_write_ptr-write_ptr)-1);i++)
+	  for(i=0;i<((uart_write_ptr-write_ptr));i++)
 	  {	
-		tty_insert_flip_string(&tpkp->port, (char*)(sh_ptr + write_ptr), count);	
+		tty_insert_flip_string(&tpkp->port, 
+					   (char*)(sh_ptr + write_ptr), count);	
 		tty_flip_buffer_push(&tpkp->port);
 		write_ptr += 1;
 	  }
-	}	
+	}
+	else
+	{
+		//printk("%c",*buf);
+		*(sh_ptr + write_ptr) = *buf;
+		tty_insert_flip_string(&tpkp->port, buf, count);
+                tty_flip_buffer_push(&tpkp->port);
+		write_ptr += 1;
+		*read = write_ptr; // nothing but: DDR_RAM_PHYS+READ_PTR_OFFSET
+	}
+
 
 	mutex_unlock(&tpkp->port_write_mutex);
 
