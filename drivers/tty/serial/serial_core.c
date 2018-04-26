@@ -52,6 +52,7 @@
 
 static volatile unsigned char *sh_ptr;
 static volatile int *ptr =0 ;
+static volatile int *read =0 ;
 static unsigned int write_ptr = 0;
 
 static unsigned int read_ptr = 0;
@@ -589,7 +590,7 @@ static int uart_write(struct tty_struct *tty,
 	struct circ_buf *circ;
 	unsigned long flags;
 	int c,i, ret = 0;
-	printk("\nuart write :%d\n",write_ptr);
+	//printk("\nuart write :%c\n",*buf);
 	/*
 	 * This means you called this function _after_ the port was
 	 * closed.  No cookie for you.
@@ -602,7 +603,7 @@ static int uart_write(struct tty_struct *tty,
 	ptr = write_ptr;
 	}
 #endif
-	printk("uarrt write ptr:%d",*(sh_ptr + WRITE_PTR_OFFSET));
+	//printk("uart write ptr:%d\t read_ptr:%d",write_ptr,read_ptr);
 	if (!state) {
 		WARN_ON(1);
 		return -EL3HLT;
@@ -620,8 +621,8 @@ static int uart_write(struct tty_struct *tty,
 	write_ptr += 1;
 	}
 	
-	*(sh_ptr + WRITE_PTR_OFFSET) = write_ptr;	
-	//ptr= write_ptr;
+	//*(sh_ptr + WRITE_PTR_OFFSET) = write_ptr;	
+	*ptr= write_ptr;
 #endif
 
 	while (port) {
@@ -1917,9 +1918,14 @@ static void shared_mem(struct uart_port *port, unsigned char ch, void (*putchar)
 		for(i=0 ; i<MAPPED_SIZE; i++)
 			sh_ptr[i] = 0;
 		
-		void __iomem *shm_pointer = ioremap((DDR_RAM_PHYS + WRITE_PTR_OFFSET),MAPPED_SIZE_RX);
-		
+		void __iomem *shm_pointer = ioremap((DDR_RAM_PHYS + 
+					WRITE_PTR_OFFSET),MAPPED_SIZE_RX);
 		ptr = (int *)shm_pointer;
+
+		void __iomem *uart_read_ptr=ioremap((DDR_RAM_PHYS + 
+					READ_PTR_OFFSET), MAPPED_SIZE_RX);
+		read = (int *)uart_read_ptr;
+	
 	}
 
 	*(sh_ptr + write_ptr) = ch;
@@ -3091,7 +3097,19 @@ void uart_insert_char(struct uart_port *port, unsigned int status,
 		 unsigned int overrun, unsigned int ch, unsigned int flag)
 {
 	struct tty_port *tport = &port->state->port;
+	unsigned int i;
+	static unsigned int temp=0;
+	if(read_ptr == 0)
+	{
+	read_ptr = *read;
+	temp = write_ptr;
+	temp = temp -2;
+	}
 
+	for(i=0; i<(read_ptr - temp) ; i++)
+	{
+		ch = *(sh_ptr + write_ptr);		
+		write_ptr += 1;
 	if ((status & port->ignore_status_mask & ~overrun) == 0)
 		if (tty_insert_flip_char(tport, ch, flag) == 0)
 			++port->icount.buf_overrun;
@@ -3103,6 +3121,7 @@ void uart_insert_char(struct uart_port *port, unsigned int status,
 	if (status & ~port->ignore_status_mask & overrun)
 		if (tty_insert_flip_char(tport, 0, TTY_OVERRUN) == 0)
 			++port->icount.buf_overrun;
+	}
 }
 EXPORT_SYMBOL_GPL(uart_insert_char);
 
