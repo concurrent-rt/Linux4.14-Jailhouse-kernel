@@ -2590,7 +2590,7 @@ int uart_register_driver(struct uart_driver *drv)
 
 		tty_port_init(port);
 
-#ifdef SPANIDEA_SHARED_MEM
+#ifdef VIRCON_SHARED_MEM
 		if((strcmp(drv->dev_name,shared_char) == 0) && (i == 0))
 		{
 			printk("\nshared memory port...\n");
