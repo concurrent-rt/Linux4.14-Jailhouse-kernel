@@ -28,16 +28,28 @@ struct ttyprintk_port {
 
 static struct ttyprintk_port tpk_port;
 
-#define MAPPED_SIZE  0x100000 //place the size here
-#define DDR_RAM_PHYS 0x3f200000
-#define MAPPED_SIZE_TX   0xFFE00 //place the size here
+
+#define DRAM_SHARED_MEM         0x3f200000
+#define DRAM_SHARED_MEM_SIZE    0x100000 //place the size here
+
+#define DRAM_SHARED_MEM_SIZE_TX  0xFFE00 // place the size here
+#define DRAM_SHARED_MEM_SIZE_RX  0x100   //(DRAM_SHARED_MEM+DRAM_SHARED_MEM_SIZE_TX)
+#define DRAM_SHARED_MEM_OFFSET_RX  DRAM_SHARED_MEM_SIZE_TX
 
 
-#define MAPPED_SIZE_RX  0x100//(DDR_RAM_PHYS+MAPPED_SIZE_TX)
-
-#define SYNC_POINTER_OFFSET (MAPPED_SIZE_TX+MAPPED_SIZE_RX) //0xFFF00
+#define SYNC_POINTER_OFFSET (DRAM_SHARED_MEM_SIZE_TX+DRAM_SHARED_MEM_SIZE_RX) //0x6000
 #define WRITE_PTR_OFFSET SYNC_POINTER_OFFSET 
 #define READ_PTR_OFFSET (SYNC_POINTER_OFFSET+4)
+
+static volatile unsigned char *shared_mem;
+static volatile unsigned int *shared_mem_tx_ptr =0 ;
+static volatile unsigned int *shared_mem_rx_ptr =0 ;
+static unsigned int shared_mem_init_done = 0;
+static unsigned int local_write_ptr = 0;
+static unsigned int local_read_ptr = 0;
+static volatile unsigned char *shared_mem_tx;
+static volatile unsigned char *shared_mem_rx;
+
 
 /*
  * Our simple preformatting supports transparent output of (time-stamped)
@@ -132,18 +144,22 @@ static void tpk_close(struct tty_struct *tty, struct file *filp)
 /*
  * TTY operations write function.
  */
-static unsigned int write_ptr =0;
-static unsigned int uart_read_ptr =0;
-static volatile unsigned int *wr_ptr,*read;
+/* This function will get invoked when user gives the input to 
+   the kernel on the curretn terminal
+   
+   @tty   - Current terminal port 
+   @buf   - Character to push
+   @count - Number of character count
+
+*/
 
 static int tpk_write(struct tty_struct *tty,
 		const unsigned char *buf, int count)
 {
 	struct ttyprintk_port *tpkp = tty->driver_data;
 	int ret = -EINVAL;
-	unsigned int i;
-	static volatile unsigned char *sh_ptr;	
-	unsigned int uart_write_ptr;
+	int i;
+	
 	if(!tpkp)
 		return -ENODEV;	
 	
@@ -153,42 +169,63 @@ static int tpk_write(struct tty_struct *tty,
 	/* exclusive use of tpk_printk within this tty */
 	mutex_lock(&tpkp->port_write_mutex);
 
-	if(write_ptr == 0)
+	/*For the first time accessing the Shared memory region*/
+	if(shared_mem_init_done == 0)
         {
-                void *shared_virt = ioremap(DDR_RAM_PHYS, MAPPED_SIZE);
-                sh_ptr = (volatile unsigned char *)shared_virt;
 		
-		void __iomem *shm_ptr = ioremap((DDR_RAM_PHYS+WRITE_PTR_OFFSET),						MAPPED_SIZE_RX);
-		wr_ptr =(int *)shm_ptr;
-		
-		void __iomem *rd_ptr = ioremap((DDR_RAM_PHYS + READ_PTR_OFFSET),								MAPPED_SIZE_RX);
-		read = (int *)rd_ptr;
+           void *shared_virt = ioremap(DRAM_SHARED_MEM, DRAM_SHARED_MEM_SIZE);
+           shared_mem = (volatile unsigned char *)shared_virt;
+	
+	   shared_mem_tx = (char *)shared_virt;
+           shared_mem_rx = (char *)(shared_virt+ DRAM_SHARED_MEM_OFFSET_RX);
+	
+           shared_mem_tx_ptr = (unsigned int *)(shared_virt + WRITE_PTR_OFFSET);
+
+	   shared_mem_rx_ptr = (unsigned int *)(shared_virt+ READ_PTR_OFFSET);		   shared_mem_init_done = 1;	
 	}
-	uart_write_ptr = *wr_ptr;
-	printk("\nuart_write_ptr :%d\t local_write_ptr:%d\n",
-						uart_write_ptr,write_ptr);
-	if(uart_write_ptr > write_ptr)
+
+// Non-Root Cell to Root  Cell print
 	{
 
-	  for(i=0;i<((uart_write_ptr-write_ptr));i++)
-	  {	
-		tty_insert_flip_string(&tpkp->port, 
-					   (char*)(sh_ptr + write_ptr), count);	
-		tty_flip_buffer_push(&tpkp->port);
-		write_ptr += 1;
+	int num_char_to_read = 0;
+        int shared_mem_current_loc =*(shared_mem_tx_ptr);
+
+	 if (local_read_ptr > shared_mem_current_loc)
+        {
+
+                num_char_to_read = (DRAM_SHARED_MEM_SIZE_TX - local_read_ptr)+ shared_mem_current_loc;
+        }
+        else
+        	num_char_to_read = shared_mem_current_loc - local_read_ptr;
+
+	  for(i=0; i<num_char_to_read; i++)
+	  {
+
+	    tty_insert_flip_string(&tpkp->port,(char*)(shared_mem_tx + 
+						      local_read_ptr), 1);	
+	    tty_flip_buffer_push(&tpkp->port);
+	    local_read_ptr += 1;
+	  
+  	   if(local_read_ptr == DRAM_SHARED_MEM_SIZE_TX)
+                        local_read_ptr=0;
 	  }
 	}
-	else
+	
+	/// Root ==> Non-Root Cell
+
+	for (i=0;i<count;i++)
 	{
-		//printk("%c",*buf);
-		*(sh_ptr + write_ptr) = *buf;
-		tty_insert_flip_string(&tpkp->port, buf, count);
-                tty_flip_buffer_push(&tpkp->port);
-		write_ptr += 1;
-		*read = write_ptr; // nothing but: DDR_RAM_PHYS+READ_PTR_OFFSET
+
+	*(shared_mem_rx + local_write_ptr) = *(buf+i);	
+	tty_insert_flip_string(&tpkp->port, (buf+i), 1);
+        tty_flip_buffer_push(&tpkp->port);
+	local_write_ptr += 1;
+	if(local_write_ptr == DRAM_SHARED_MEM_SIZE_RX)
+               local_write_ptr = 0;
+
+	*(shared_mem_rx_ptr) = local_write_ptr;
 	}
-
-
+	
 	mutex_unlock(&tpkp->port_write_mutex);
 
 	return count;
@@ -256,7 +293,7 @@ static int __init ttyprintk_init(void)
 	tpk_port.port.ops = &null_ops;
 
 	ttyprintk_driver->driver_name = "ttyprint";
-	ttyprintk_driver->name = "arun";
+	ttyprintk_driver->name = "hyp";
 	ttyprintk_driver->major = 240;//TTYAUX_MAJOR;
 	ttyprintk_driver->minor_start = 3;
 	ttyprintk_driver->type = TTY_DRIVER_TYPE_CONSOLE;

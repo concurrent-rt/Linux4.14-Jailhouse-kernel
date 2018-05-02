@@ -36,27 +36,48 @@
 #include <linux/delay.h>
 #include <linux/mutex.h>
 
+
+//#include <linux/serial_8250.h>
+
 #include <linux/irq.h>
 #include <linux/uaccess.h>
 
-#define MAPPED_SIZE  0x100000 //place the size here
-#define DDR_RAM_PHYS 0x3f200000
-#define MAPPED_SIZE_TX  0xFFE00//0x5000 //place the size here
+#define VIRCON_SHARED_MEM 1
+
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+
+#ifdef VIRCON_SHARED_MEM
+#define DRAM_SHARED_MEM 	0x3f200000
+#define DRAM_SHARED_MEM_SIZE  	0x100000 //place the size here
+
+#define DRAM_SHARED_MEM_SIZE_TX  0xFFE00 // place the size here
+#define DRAM_SHARED_MEM_SIZE_RX  0x100   //(DRAM_SHARED_MEM+DRAM_SHARED_MEM_SIZE_TX)
+#define DRAM_SHARED_MEM_OFFSET_RX  DRAM_SHARED_MEM_SIZE_TX
 
 
-#define MAPPED_SIZE_RX  0x100 //(DDR_RAM_PHYS+MAPPED_SIZE_TX)
-
-#define SYNC_POINTER_OFFSET (MAPPED_SIZE_TX+MAPPED_SIZE_RX) //0x6000
+#define SYNC_POINTER_OFFSET (DRAM_SHARED_MEM_SIZE_TX+DRAM_SHARED_MEM_SIZE_RX) //0x6000
 #define WRITE_PTR_OFFSET SYNC_POINTER_OFFSET 
 #define READ_PTR_OFFSET (SYNC_POINTER_OFFSET+4)
 
-static volatile unsigned char *sh_ptr;
-static volatile int *ptr =0 ;
-static volatile int *read =0 ;
-static unsigned int write_ptr = 0;
+static volatile unsigned char *shared_mem_tx;
+static volatile unsigned char *shared_mem_rx;
+static volatile unsigned int *shared_mem_tx_ptr =0 ;
+static volatile unsigned int *shared_mem_rx_ptr =0 ;
 
-static unsigned int read_ptr = 0;
+static unsigned int local_write_ptr = 0;
+static unsigned int local_read_ptr = 0;
+static unsigned int shared_mem_init_done = 0;
+static struct tty_port *shared_mem_port = 0;
+unsigned char shared_char[] = "ttyS";
 
+void periodic_poll_rx(unsigned long data);
+int g_time_interval = 1000;
+struct timer_list g_timer_shared_mem;
+DEFINE_TIMER(g_timer_shared_mem, periodic_poll_rx,0,0);
+#endif
+
+static struct uart_port **tick_port;
 /*
  * This is used to lock changes in serial line configuration.
  */
@@ -590,20 +611,10 @@ static int uart_write(struct tty_struct *tty,
 	struct circ_buf *circ;
 	unsigned long flags;
 	int c,i, ret = 0;
-	//printk("\nuart write :%c\n",*buf);
 	/*
 	 * This means you called this function _after_ the port was
 	 * closed.  No cookie for you.
 	 */
-#if 0
-	if(ptr == 0)
-	{
-	void __iomem *sample = ioremap((DDR_RAM_PHYS+WRITE_PTR_OFFSET),MAPPED_SIZE_RX);
-	ptr = (int*)sample;
-	ptr = write_ptr;
-	}
-#endif
-	//printk("uart write ptr:%d\t read_ptr:%d",write_ptr,read_ptr);
 	if (!state) {
 		WARN_ON(1);
 		return -EL3HLT;
@@ -613,18 +624,18 @@ static int uart_write(struct tty_struct *tty,
 	if (!circ->buf)
 		return 0;
 
-	port = uart_port_lock(state, flags);
-#if 1 
+#ifdef VIRCON_SHARED_MEM 
         for(i=0; i<count; i++)
 	{
-	*(sh_ptr + write_ptr) = *(buf+i);
-	write_ptr += 1;
+		*(shared_mem_tx + local_write_ptr) = *(buf+i);
+		local_write_ptr = local_write_ptr + 1;
+		if(local_write_ptr == DRAM_SHARED_MEM_SIZE_TX)
+			local_write_ptr=0;
 	}
-	
-	//*(sh_ptr + WRITE_PTR_OFFSET) = write_ptr;	
-	*ptr= write_ptr;
+	*(shared_mem_tx_ptr) = local_write_ptr;
 #endif
 
+	port = uart_port_lock(state, flags);
 	while (port) {
 		c = CIRC_SPACE_TO_END(circ->head, circ->tail, UART_XMIT_SIZE);
 		if (count < c)
@@ -638,7 +649,6 @@ static int uart_write(struct tty_struct *tty,
 		ret += c;
 	}
 
-	//printk("\nafter while uart write\n");
 
 	__uart_start(tty);
 	uart_port_unlock(port, flags);
@@ -1911,27 +1921,26 @@ static void shared_mem(struct uart_port *port, unsigned char ch, void (*putchar)
 	putchar(port,'=');*/
 	unsigned int i;
 	
-	if(write_ptr == 0)
+	if(shared_mem_init_done == 0)
 	{
-		void __iomem *shared_virt = ioremap(DDR_RAM_PHYS, MAPPED_SIZE);
-		sh_ptr = (char *)shared_virt;
-		for(i=0 ; i<MAPPED_SIZE; i++)
-			sh_ptr[i] = 0;
+		void __iomem *shared_virt = ioremap(DRAM_SHARED_MEM, DRAM_SHARED_MEM_SIZE);
+		volatile char *shared_mem = (char *)shared_virt;
+		for(i=0 ; i<DRAM_SHARED_MEM_SIZE; i++)
+			shared_mem[i] = 0;
 		
-		void __iomem *shm_pointer = ioremap((DDR_RAM_PHYS + 
-					WRITE_PTR_OFFSET),MAPPED_SIZE_RX);
-		ptr = (int *)shm_pointer;
+		shared_mem_tx = (char *)shared_virt;
+		shared_mem_rx = (char *)(shared_virt+ DRAM_SHARED_MEM_OFFSET_RX);
+		shared_mem_tx_ptr = (unsigned int *)(shared_virt+ WRITE_PTR_OFFSET);
+		shared_mem_rx_ptr = (unsigned int *)(shared_virt+ READ_PTR_OFFSET);
 
-		void __iomem *uart_read_ptr=ioremap((DDR_RAM_PHYS + 
-					READ_PTR_OFFSET), MAPPED_SIZE_RX);
-		read = (int *)uart_read_ptr;
-	
+		shared_mem_init_done =1;
 	}
 
-	*(sh_ptr + write_ptr) = ch;
-	write_ptr = write_ptr + 1;
-	//*(sh_ptr + WRITE_PTR_OFFSET) = write_ptr;
-	*ptr = write_ptr;
+	*(shared_mem_tx + local_write_ptr) = ch;
+	local_write_ptr = local_write_ptr + 1;
+	if(local_write_ptr == DRAM_SHARED_MEM_SIZE_TX)
+		local_write_ptr=0;
+	*(shared_mem_tx_ptr) = local_write_ptr;
 }
 
 
@@ -2542,6 +2551,8 @@ int uart_register_driver(struct uart_driver *drv)
 	printk("\nuart_register_driver init..dr :%d\n",drv->nr);
 	BUG_ON(drv->state);
 
+	mod_timer(&g_timer_shared_mem, jiffies + msecs_to_jiffies(g_time_interval));
+
 	/*
 	 * Maybe we should be using a slab cache for this, especially if
 	 * we have a large number of ports to handle.
@@ -2579,6 +2590,14 @@ int uart_register_driver(struct uart_driver *drv)
 
 		tty_port_init(port);
 
+#ifdef SPANIDEA_SHARED_MEM
+		if((strcmp(drv->dev_name,shared_char) == 0) && (i == 0))
+		{
+			printk("\nshared memory port...\n");
+			shared_mem_port = port;
+		}
+#endif
+
 		port->ops = &uart_port_ops;
 	}
 
@@ -2609,6 +2628,8 @@ void uart_unregister_driver(struct uart_driver *drv)
 {
 	struct tty_driver *p = drv->tty_driver;
 	unsigned int i;
+
+	del_timer(&g_timer_shared_mem);
 
 	tty_unregister_driver(p);
 	put_tty_driver(p);
@@ -3081,6 +3102,13 @@ void uart_handle_cts_change(struct uart_port *uport, unsigned int status)
 }
 EXPORT_SYMBOL_GPL(uart_handle_cts_change);
 
+void access_port(struct uart_port **temp_port)
+{
+        tick_port = temp_port;
+
+}
+
+
 /**
  * uart_insert_char - push a char to the uart layer
  *
@@ -3093,23 +3121,40 @@ EXPORT_SYMBOL_GPL(uart_handle_cts_change);
  * @ch: character to push
  * @flag: flag for the character (see TTY_NORMAL and friends)
  */
+void periodic_poll_rx(unsigned long data)
+{
+	int i;
+	unsigned char ch;	
+	int num_char_to_read = 0;
+	int shared_mem_current_loc =*(shared_mem_rx_ptr);
+	if (local_read_ptr > shared_mem_current_loc)
+	{
+		num_char_to_read = (DRAM_SHARED_MEM_SIZE_RX - local_read_ptr)+ shared_mem_current_loc;	
+	}
+	else
+	num_char_to_read = shared_mem_current_loc - local_read_ptr;
+	
+	//printk("\nperiodic_poll_rx shared ptr :%d \t local:%d\n",shared_mem_current_loc,local_read_ptr);
+
+	for(i=0; i<num_char_to_read ; i++)
+	{
+		ch = *(shared_mem_rx + local_read_ptr);
+		local_read_ptr = local_read_ptr + 1;
+		if(local_read_ptr == DRAM_SHARED_MEM_SIZE_RX)
+			local_read_ptr = 0;
+		if (tty_insert_flip_char(shared_mem_port, ch, TTY_NORMAL) == 0)
+			printk("ERROR\n");
+		tty_flip_buffer_push(shared_mem_port);
+	}
+	mod_timer(&g_timer_shared_mem, jiffies + msecs_to_jiffies(g_time_interval));
+}
+
 void uart_insert_char(struct uart_port *port, unsigned int status,
 		 unsigned int overrun, unsigned int ch, unsigned int flag)
 {
 	struct tty_port *tport = &port->state->port;
-	unsigned int i;
-	static unsigned int temp=0;
-	if(read_ptr == 0)
-	{
-	read_ptr = *read;
-	temp = write_ptr;
-	temp = temp -2;
-	}
-
-	for(i=0; i<(read_ptr - temp) ; i++)
-	{
-		ch = *(sh_ptr + write_ptr);		
-		write_ptr += 1;
+	int i;
+	
 	if ((status & port->ignore_status_mask & ~overrun) == 0)
 		if (tty_insert_flip_char(tport, ch, flag) == 0)
 			++port->icount.buf_overrun;
@@ -3121,9 +3166,12 @@ void uart_insert_char(struct uart_port *port, unsigned int status,
 	if (status & ~port->ignore_status_mask & overrun)
 		if (tty_insert_flip_char(tport, 0, TTY_OVERRUN) == 0)
 			++port->icount.buf_overrun;
-	}
+#endif
+	
 }
 EXPORT_SYMBOL_GPL(uart_insert_char);
+
+
 
 EXPORT_SYMBOL(uart_write_wakeup);
 EXPORT_SYMBOL(uart_register_driver);
